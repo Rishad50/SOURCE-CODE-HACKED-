@@ -4,15 +4,31 @@ import time
 import shutil
 import zipfile
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# --- DUMMY SERVER FOR RENDER (Web Service Support) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running alive!")
+
+def run_dummy_server():
+    # Render নিজে থেকে একটি PORT এনভায়রনমেন্ট ভেরিয়েবল দেয়
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
 # --- CONFIGURATION ---
-# টোকেন পরিবেশ ভেরিয়েবল থেকে নিন অথবা সরাসরি এখানে বসান
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8403146081:AAH199zB5ROvxcm0mUe6qeoz3DYCxyjLw9k")
+# Render Environment Variables থেকে টোকেন নেবে, না পেলে ডিফল্ট বসবে
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8403146081:AAH199zB5ROvxcm0mUe6qeoz3DYCxyjLw9k")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 MAX_DEPTH = 2
@@ -37,7 +53,6 @@ class BotScraper:
         
         self.stats = {"pages": 0, "images": 0, "scripts": 0, "styles": 0, "apis": 0, "errors": 0}
         
-        # ইউনিক ফোল্ডার তৈরি করার জন্য টাইমস্ট্যাম্প যোগ করা হয়েছে
         self.project_name = f"{self.domain.replace('.', '_')}_{int(time.time())}"
         self.base_folder = os.path.abspath(self.project_name)
         self.assets_folder = os.path.join(self.base_folder, "assets")
@@ -58,13 +73,11 @@ class BotScraper:
             response = self.session.get(url, timeout=10)
             if response.status_code == 200:
                 return 200, response.content
-            
             if response.status_code == 403:
                 self.session.headers['Accept'] = 'text/html'
                 response2 = self.session.get(url, timeout=10)
                 if response2.status_code == 200:
                     return 200, response2.content
-            
             return response.status_code, None
         except Exception as e:
             return -1, str(e)
@@ -142,14 +155,8 @@ class BotScraper:
             err_msg = f"Failed {url}: Status {status}"
             self.stats["errors"] += 1
             self.error_log.append(err_msg)
-            try:
-                with open(os.path.join(self.error_folder, "error_log.txt"), 'a') as f:
-                    f.write(f"{err_msg}\n")
-            except Exception:
-                pass
             return
 
-        # পাথ কনফ্লিক্ট এড়ানোর জন্য সেফ ফাইল সেভিং
         path = urlparse(url).path.strip('/')
         if not path:
             file_path = os.path.join(self.pages_folder, "index.html")
@@ -163,10 +170,9 @@ class BotScraper:
             with open(file_path, 'wb') as f:
                 f.write(content)
             self.stats["pages"] += 1
-        except Exception as e:
+        except Exception:
             self.stats["errors"] += 1
 
-        # কন্টেন্ট পার্সিং
         try:
             soup = BeautifulSoup(content, 'html.parser')
             self.scan_for_apis(content.decode('utf-8', errors='ignore'), url)
@@ -189,7 +195,6 @@ class BotScraper:
 
             for link in soup.find_all('a', href=True):
                 next_url = urljoin(url, link['href'])
-                # শুধুমাত্র http বা https লিঙ্ক স্ক্র্যাপ করবে
                 if next_url.startswith(('http://', 'https://')):
                     self.scrape_page(next_url, current_depth + 1)
 
@@ -205,8 +210,6 @@ class BotScraper:
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, self.base_folder)
                     zipf.write(file_path, arcname)
-        
-        # জিপ তৈরির পর অস্থায়ী ফোল্ডার মুছে ডিস্ক ফাঁকা রাখা
         shutil.rmtree(self.base_folder, ignore_errors=True)
         return zip_name
 
@@ -220,8 +223,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Hello! I am Website Source Downloader Bot.\n\n"
         "Commands:\n"
-        "/download <url> - Download full source code & assets\n"
-        "/help - Show help"
+        "/download <url> - Download full source code & assets"
     )
 
 async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -240,9 +242,7 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scraper = BotScraper(url)
         zip_filename = await asyncio.to_thread(scraper.run)
 
-        file_size = os.path.getsize(zip_filename)
-        file_size_mb = file_size / (1024 * 1024)
-
+        file_size_mb = os.path.getsize(zip_filename) / (1024 * 1024)
         stats_text = (
             f"✅ Download Complete!\n\n"
             f"📄 Pages: {scraper.stats['pages']}\n"
@@ -250,15 +250,12 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📜 Scripts: {scraper.stats['scripts']}\n"
             f"🎨 Styles: {scraper.stats['styles']}\n"
             f"🔌 APIs: {scraper.stats['apis']}\n"
-            f"❌ Errors: {scraper.stats['errors']}\n"
             f"📦 Size: {file_size_mb:.2f} MB"
         )
-
         await msg.edit_text(stats_text)
 
-        # টেলিগ্রাম বট API লিমিট (৫০ MB) চেক
         if file_size_mb > 49.5:
-            await update.message.reply_text("⚠️ ফাইল সাইজ ৫০MB-এর বেশি হওয়ায় টেলিগ্রামে পাঠানো সম্ভব হচ্ছে না।")
+            await update.message.reply_text("⚠️ ফাইল সাইজ ৫০MB-এর বেশি হওয়ায় পাঠানো যাচ্ছে না।")
         else:
             with open(zip_filename, 'rb') as f:
                 await context.bot.send_document(
@@ -266,20 +263,23 @@ async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     document=f,
                     caption=f"Source code for {url}"
                 )
-
     except Exception as e:
         await msg.edit_text(f"❌ Error occurred: {str(e)}")
     finally:
-        # জিপ ফাইল পাঠানোর পর লোকাল ফাইল ডিলিট করা
         if zip_filename and os.path.exists(zip_filename):
             os.remove(zip_filename)
 
 def main():
+    # 1. Start Web Server in Background for Render Port Binding
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+
+    # 2. Run Telegram Bot
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("download", download))
-    print("Bot is running... (Press Ctrl+C to stop)")
+    
+    print("Bot is starting...")
     application.run_polling()
 
 if __name__ == "__main__":
-    main()জ
+    main()
